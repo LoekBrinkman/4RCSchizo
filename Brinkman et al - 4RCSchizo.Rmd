@@ -1,0 +1,602 @@
+---
+title: "RC Schizo"
+author: "Loek Brinkman"
+date: "14/9/2019"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r Initialize, include = FALSE}
+rm(list = ls()) #clear all
+library(tidyverse)
+library(stringr)
+library(jmv)
+library(rcicr) #develepors verion:  install_github("rdotsch/rcicr", ref = "development")
+library(pastecs)
+library(lsr)
+library(cowplot)
+library(broom)
+library(parallel)
+library(psych)
+library(nlme)
+library(effsize)
+```
+
+
+```{r load & clean data, include=FALSE}
+#list all datafiles: use a regex to find all files that end with a digit and then ".csv"
+input_files <- list.files(path = "rcsz_data", pattern = "\\d\\.csv$") %>% str_c("rcsz_data/",. ) 
+dat = lapply(input_files, read_delim, delim = "\t") %>% bind_rows()    
+rdata = 'rcic_seed_1_time_Feb_02_2016_16_38.Rdata'
+
+#excluded participants (part 1/2): see logfile for justification
+excluded <- c(91, 106, 110, 128, 139, 999) 
+dat <- dat %>% filter(!scipID %in% excluded)
+
+#Fix 1: # ppn 136 & 146 are both in file 38 (due to a typo). Should be only 146. 136 was a drop-out. Check timestamps to confirm that in the first sessions, 136 should be 146
+dat_subset <- dat %>% filter((scipID == 136 | scipID == 146) & (trial == 1 | trial == 451))
+#as.POSIXct(dat_subset$unixtime, origin = "1970-01-01") # Confirmed! session 1 is from 6/9 and seession two is from 29/9. Change 136 into 146 and continue
+dat[dat$scipID == 136,]$scipID <- 146
+
+#Fix 2: the second sessions of 95 and 97 have been switched
+#this doesn't matter, as the data is grouped (later) on scipID
+#These participants probably do not have a non-overlapping stimilus-set (duplicate/missing stimuli). Should not have a big effect on the classification images
+  # a <- dat %>% filter(scipID == 95); b <- dat %>% filter(scipID == 97); c <- dat %>% filter(scipID == 93)
+  # hist(a$stimulus) ; hist(b$stimulus); hist(c$stimulus) 
+
+dat <- dat %>% 
+  mutate(participant = ifelse(patient == 1, 'patient', 'control')) %>%    #give 'patient' column a more informative name
+  mutate(resp_construct = recode(response, "1" = "trust", "0" = "neutral", "-1" = "untrust")) %>%  #add column whether responses where trust(1), neutral(0) or untrust(-1)
+  mutate(scipID = as.character(scipID))
+
+#exclude participants (part 2/2): with incomplete datasets 
+#threshold can be set for exploratory analyes including (part of) of the incomplete datasets
+dat_all <- dat #keep data of all participants, for comparison
+threshold_completed <- 1
+subj_incomplete <- dat %>%
+  group_by(scipID, patient) %>%
+  summarise(ntrials = n()) %>%
+  filter(ntrials < threshold_completed * 900) %>%
+  .$scipID #lack of time was primary reason for incomplete data-sets
+dat <- dat %>% filter(!scipID %in% subj_incomplete)
+
+percentage_completed <- dat_all %>%
+  group_by(scipID, patient) %>%
+  summarise(perc_compl = n()) %>% 
+  ungroup() %>% 
+  mutate(scipID = as.integer(scipID))
+```
+
+
+```{r discriptives, reaction times & response distributions}
+### discriptives
+# 57 datasets: 23 patients & 34 controls
+dat %>% group_by(scipID, patient) %>% summarise(n()) %>% ungroup() %>% summarise(patients = sum(patient), controls = length(patient) - sum(patient))
+
+### Median response times
+medianRTs <- dat %>% 
+  group_by(scipID, participant) %>% 
+  summarise(medianRT = median(RT)) 
+
+fig_2a <- medianRTs %>% 
+  ggplot(aes(x = participant, y = medianRT)) +
+  geom_violin(aes(group = participant, fill = participant)) + 
+  geom_boxplot(aes(group = participant), width = 0.2) +
+  geom_jitter(size = 0.5, width = 0.2) 
+
+meanRTs_to_report <- medianRTs %>% 
+  group_by(participant) %>% 
+  summarise(GAVG_meanRT = mean(medianRT), SD_GAVG_meanRT = sd(medianRT)) #INFO TO REPORT!
+
+## test difference of reaction times: patients vs controls
+#test for normality
+medianRTs %>% group_by(participant) %>% summarise(test = shapiro.test(medianRT)$p.value) # RTs of controls not normally distributed - continue with 
+
+#non-parametric test
+test_out <- wilcox.test(medianRTs$medianRT ~ medianRTs$participant) #no significant difference in RT
+
+rFromWilcox<-function(wilcoxModel, N){
+  z<- qnorm(wilcoxModel$p.value/2)
+  r<- z/ sqrt(N)
+  cat(wilcoxModel$data.name, "Effect Size, r = ", r)
+}
+
+N <- nrow(medianRTs)
+rFromWilcox(test_out, N)
+#Unfortunately, I do not know how to compute confidence intervals around this effect-size. If you do, please contact me at loekbrinkman@gmail.com, or add a suggestion via Github. Thx! 
+
+
+### Response distributions
+#responses per ppn
+response_dist <- dat %>% 
+  group_by(scipID, participant) %>% 
+  summarise(trustworthy = 100*sum(response == 1)/n(), neutral = 100*sum(response == 0)/n(), untrustworthy = 100*sum(response == -1)/n())
+
+response_dist_wide <- response_dist %>% 
+  gather(trustworthy, neutral, untrustworthy, key = construct, value = 'percentage of responses')
+
+#plot
+level_order <- c('trustworthy', 'neutral', 'untrustworthy')
+plot_resdis <- response_dist_wide %>% 
+  ggplot(aes(x = factor(construct, level = level_order), y = `percentage of responses`)) + 
+  geom_hline(yintercept = 33.33, linetype = "dashed", size = 1, alpha = 0.6) +
+  geom_line(aes(group = scipID), alpha = 0.2) + 
+  geom_boxplot(aes(fill = factor(construct, level = level_order)), width = 0.2) +
+  facet_wrap(~participant) +
+  theme(legend.position="none")
+plot_resdis
+
+response_dist_2report <- response_dist_wide %>% 
+  group_by(construct, participant) %>% 
+  summarise(mean = mean(`percentage of responses`), sd = sd(`percentage of responses`)) %>% 
+  mutate(mean = round(mean), sd = round(sd)) %>% 
+  arrange(participant) 
+response_dist_2report
+
+
+#write_csv(response_dist, "dat_4jmv.csv") #detour through Jamovi
+
+stat_out <- 
+jmv::anovaRM(
+    data = response_dist,
+    rm = list(
+        list(
+            label="response option",
+            levels=c(
+                "trustworthy",
+                "neutral",
+                "untrustworthy"))),
+    rmCells = list(
+        list(
+            measure="trustworthy",
+            cell="trustworthy"),
+        list(
+            measure="neutral",
+            cell="neutral"),
+        list(
+            measure="untrustworthy",
+            cell="untrustworthy")),
+    bs = "participant",
+    rmTerms = list(
+        "response option"),
+    bsTerms = list(
+        "participant"),
+    effectSize = "partEta"#,
+    #emMeans = list(NULL) #this goes wrong when copy-pasting from Jamovi. Check versions package & Jamovi??
+    )
+
+
+
+
+stat_out
+#interaction not significant (in fact, no significant differences between any condition)
+#crucial, no difference between patient_neutral vs controls_neutral
+#problem with the post-hoc tests from Jamovi, error when copying syntax from Jamovi
+
+#base-R post-hoc test for patient_neutral vs controls_neutral
+#check assumption: data is normally distributed
+response_dist %>% 
+  ungroup() %>% 
+  select(participant, neutral) %>% 
+  group_by(participant) %>% 
+  summarise(test_normal = shapiro.test(neutral)$p.value) #data is normally distributed
+t.test(response_dist$neutral ~ response_dist$participant) #(p = 0.38)
+cohensD(response_dist$neutral  ~ response_dist$participant) #(d = 0.23)
+```
+
+
+
+```{r Compute classification images}
+
+#compute classification images for all participants, including those of participants with incomplete datasets
+
+dat <- dat_all # include also participants with incomplete datasets
+
+# Individual CIs (indepently scaled)
+individual_cis <- list()
+responseoptions <- unique(dat$response)
+for (p in unique(dat$scipID)) { #loop over ppn
+  cidat <- dat %>% filter(scipID == p) #take dat per ppn
+  for(v in responseoptions) { #loop over response options
+    #info for saving: patient or not / condition:Untrust/Neutral/Trust
+    if (cidat$patient[1] == 1){patient_or_not <- "P"} else if (cidat$patient[1] == 0){patient_or_not <- "C"}
+    if (v == -1){construct <- "U"} else if (v == 0) {construct <- "N"} else if (v == 1){construct <- "T"}
+    targetpath = 'cis/individual/independent_scaling'
+    filename <- paste0(p, '_', patient_or_not, '_', construct,'.Rdata')
+    #check if they have previously been saved to disk. if so: load. if not: compute
+    if(file.exists(paste0(targetpath, "/" , filename))){
+     load(file = paste0(targetpath, "/", filename))
+      individual_cis[[paste0(p, "_", patient_or_not, "_", construct)]] <- tmp
+      print(paste('Loading from disk - ScipID:', p, " response", v))
+    } else {
+        cidat_per_response <- cidat[cidat$response == v,] # take subset of data per response option
+        if (nrow(cidat_per_response) > 0) { #skip CI if there are not responses of a category
+          cidat_per_response <- cidat_per_response %>% mutate(response = 1) # set to 1, because that is the stimulus that is selected
+          individual_cis[[paste0(p, "_", patient_or_not, "_", construct)]] <-
+          generateCI(
+            stimuli = cidat_per_response$stimulus, 
+            responses = cidat_per_response$response, 
+            baseimage = 'male', 
+            rdata = 'rcic_seed_1_time_Feb_02_2016_16_38.Rdata',
+            save_as_png = TRUE,
+            filename = paste0(p, '_', patient_or_not, '_', construct,'.png'),
+            targetpath = targetpath)
+            tmp <- individual_cis[[paste0(p, "_", patient_or_not, "_", construct)]]
+            save(tmp, file = paste0(targetpath, "/", filename))
+            print(paste('Saving ScipID:', p, " response", v))
+        } else {
+          print(paste('Skipped: no responses for - ScipID:', p, " response", v)) 
+        }
+    }
+  }
+}
+
+
+```
+
+
+```{r INTERMEZZO}
+# we now have the classification images for each participant, which were rated on trustworthiness by an independent sample of raters. Starting from here, the script is on the rating of the subjective data
+
+```
+
+
+
+```{r load data & select relevant data}
+rm(list=setdiff(ls(), c("subj_incomplete", "percentage_completed"))) ##clear all, but the list of subject with incomplete RC datasets
+dat_v6 <- read_csv("rating task/data_exp_3610-v6_task-tfoc.csv") #first version: did not ask for ProlificID
+dat_v7 <- read_csv("rating task/data_exp_3610-v7_task-tfoc.csv") #second version: data identical to previous version- added ProlificID & Finish button
+dat_v8 <- read_csv("rating task/data_exp_3610-v8_task-tfoc.csv") #third version: data identical to previous versions - changed the time to 30 minutes (instead of 45min)
+dat_v9 <- read_csv("rating task/data_exp_3610-v9_task-tfoc.csv") #third version: data identical to previous versions - added explicit competion code for Prolific
+
+dat_v7 <- dat_v7 %>% mutate(`Event Index` = as.integer(`Event Index`))
+
+dat <- bind_rows(dat_v6, dat_v7, dat_v8, dat_v9)
+
+dat <- dat %>% filter(`Screen Name` == 'trial format', `Zone Name` == 'slider') %>% 
+  select(`Trial Number`, `Reaction Time`, `Response`, `scipID`, `resp_construct`, `participant`, `Participant Private ID`)
+
+#also include the ProlificIDs (load from informed consents and add to 'dat')
+dat_ProlID_v7 <- read_csv("rating task/data_exp_3610-v7_questionnaire-w1ye.csv") #note: for v6 ProlificID's were not recorded
+dat_ProlID_v8 <- read_csv("rating task/data_exp_3610-v8_questionnaire-w1ye.csv")
+dat_ProlID_v9 <- read_csv("rating task/data_exp_3610-v9_questionnaire-w1ye.csv")
+dat_ProlID <- bind_rows(dat_ProlID_v7, dat_ProlID_v8, dat_ProlID_v9)
+
+dat <- dat_ProlID %>% filter(`Question Key` == "ProlificID") %>% 
+  select(`Participant Private ID`, Response) %>% 
+  rename(ProlificID = Response) %>% 
+  right_join(dat)
+```
+
+```{r inspect response times, calculate average ratings per CI & Cronbach's alpha}
+(dat_sum <- dat %>% group_by(`Participant Private ID`) %>% 
+   summarize(medianResp = median(Response), sdResp = sd(Response), medianRT = median(`Reaction Time`), nTrials = n(), ProlificID = unique(ProlificID)))
+
+#remove raters with median RT below 500ms
+toReject <- dat_sum %>% filter(medianRT < 500) 
+dat <- dat %>% filter(!`Participant Private ID` %in% toReject$`Participant Private ID`)
+(dat_sum <- dat %>% group_by(`Participant Private ID`) %>% 
+   summarize(medianResp = median(Response), sdResp = sd(Response), medianRT = median(`Reaction Time`), nTrials = n(), ProlificID = unique(ProlificID)))
+
+n_raters <- length(unique(dat$`Participant Private ID`))
+
+#calculate average ratings per CI
+datCI <- dat %>% 
+  select(-ProlificID, -`Trial Number`, -`Reaction Time`) %>%
+  spread(key = c(`Participant Private ID`), value = `Response`) %>% 
+  mutate(meanRating = rowMeans(.[,4:ncol(.)])) 
+
+#remove ratings of CIs for incomplete datasets (keep a copy of original data)
+datCI_all <- datCI
+datCI <- datCI %>% filter(!scipID %in% subj_incomplete)
+
+#Cronbach's alpha
+alpha_out <- datCI %>% ungroup() %>% select(4:(ncol(datCI)-1)) %>% 
+  alpha(.) #cronbach's alpha (from psych package)
+(cronbach <- alpha_out$total$std.alpha)
+
+#compute ratings of CIs featured as examples in the manuscript (Figure 3)  - featured as insets in the images
+selection <- c(118, 135, 67, 70, 115, 146)
+datCI %>% select(scipID, resp_construct, meanRating) %>% filter(scipID %in% selection)
+```
+
+          
+
+```{r plot subjective ratings, compute slope of CI-ratings}
+#plot subjective ratings
+level_order <- c('trustworthy', 'neutral', 'untrustworthy')
+datCI %>% 
+  rename('mean rating' = meanRating) %>% 
+  mutate(participant = recode(participant, "C" = "control", "P" = "patient"),
+         resp_construct = recode(resp_construct, "T" = "trustworthy", "N" = "neutral", "U" = "untrustworthy")) %>% 
+  ggplot(aes(x = factor(resp_construct, level = level_order), y = `mean rating`)) +
+  geom_line(aes(group = scipID), alpha = 0.2) +
+  geom_boxplot(aes(fill = factor(resp_construct, level = level_order)), width = 0.1) +
+  facet_wrap(~participant) +
+  theme(legend.position="none")
+  
+        ## figure for appendix (1) including incomplete datasets
+        level_order <- c('trustworthy', 'neutral', 'untrustworthy')
+        sup_fig_X <- datCI_all %>% 
+          rename('mean rating' = meanRating) %>% 
+          mutate(participant = recode(participant, "C" = "control", "P" = "patient"),
+                 resp_construct = recode(resp_construct, "T" = "trustworthy", "N" = "neutral", "U" = "untrustworthy")) %>% 
+          ggplot(aes(x = factor(resp_construct, level = level_order), y = `mean rating`)) +
+          #geom_line(aes(group = scipID, alpha = -1*slope)) +
+          geom_line(aes(group = scipID), alpha = 0.2) +
+          geom_boxplot(aes(fill = factor(resp_construct, level = level_order)), width = 0.1) +
+          facet_wrap(~participant) +
+          theme(legend.position="none")
+        
+        ## figure for appendix (2) incomplete datasets only
+        datCI_all <- datCI_all %>% left_join(percentage_completed)
+        level_order <- c('trustworthy', 'neutral', 'untrustworthy')
+        sup_fig_XX <- datCI_all %>% 
+          filter(scipID %in% subj_incomplete) %>% 
+          rename('mean rating' = meanRating) %>% 
+          mutate(participant = recode(participant, "C" = "control", "P" = "patient"),
+                 resp_construct = recode(resp_construct, "T" = "trustworthy", "N" = "neutral", "U" = "untrustworthy")) %>% 
+          ggplot(aes(x = factor(resp_construct, level = level_order), y = `mean rating`)) +
+          geom_line(aes(group = scipID,  alpha = perc_compl)) +
+          geom_boxplot(aes(fill = factor(resp_construct, level = level_order)), width = 0.1) +
+          facet_wrap(~participant) #+
+          #theme(legend.position="none")
+        sup_fig_XX
+
+#compute slope of CI-ratings
+datCI_slope <- datCI %>% 
+  select(scipID, resp_construct, participant, meanRating) %>% 
+  spread(key = resp_construct, value = meanRating) %>% 
+  mutate(slope = T - U) %>% 
+  mutate(slope = ifelse(is.na(slope), (T - N)/2, slope)) %>% 
+  select(scipID, participant, slope)
+        
+datCI <- left_join(datCI, datCI_slope) %>% 
+  select(scipID, resp_construct, participant, meanRating, slope)
+
+toReport <- datCI %>% 
+  group_by(resp_construct, participant) %>% 
+  summarise(mean = mean(meanRating), sd = sd(meanRating)) %>% 
+  arrange(participant)
+
+#data including incomplete datasets
+datCI_slope_all <- datCI_all %>% 
+  select(scipID, resp_construct, participant, meanRating) %>% 
+  spread(key = resp_construct, value = meanRating) %>% 
+  mutate(slope = T - U) %>% 
+  mutate(slope = ifelse(is.na(slope), (T - N)/2, slope)) %>% 
+  select(scipID, participant, slope)
+
+datCI_all <- left_join(datCI_all, datCI_slope_all) %>% #CHECK: DO WE USE THIS?
+  select(scipID, resp_construct, participant, meanRating, slope)
+```
+
+
+```{r stats}
+#check assumptions for ANOVA (heterogeneity of variance, normal distribution of all groups)
+
+
+# Bartlett Test of Homogeneity of Variances
+datCI %>% 
+  unite(ANOVAgroups, resp_construct, participant) %>% 
+  bartlett.test(meanRating~ANOVAgroups, .)
+
+#visually inspect normality of the six groups (looks fine!)
+datCI %>% 
+  unite(ANOVAgroups, resp_construct, participant) %>% 
+  ggplot() +
+  geom_qq(aes(sample = meanRating)) +
+  facet_wrap(~ANOVAgroups)
+
+#continue to ANOVA
+datCI_wide <- datCI %>%
+  spread(key = resp_construct, value = meanRating)
+#write_csv(dat4JMV, 'RCschizo_4JMV_ratings.csv')
+
+#post-hoc correction: Bonferroni, but not all comparisons (just the 9 relevant ones, instead of all 15)
+stat_out <- jmv::anovaRM(
+    data = datCI_wide,
+    rm = list(
+        list(
+            label="construct",
+            levels=c("T", "U", "N"))),
+    rmCells = list(
+        list(
+            measure="T",
+            cell="T"),
+        list(
+            measure="U",
+            cell="U"),
+        list(
+            measure="N",
+            cell="N")),
+    bs = "participant",
+    rmTerms = list(
+        "construct"),
+    bsTerms = list(
+        "participant"),
+    effectSize = "partEta",
+    postHoc = list(
+        c("construct", "participant"),
+        "participant",
+        "construct"))
+
+stat_out
+#######
+
+#post-hoc t-test (Bonferroni-corrected)
+#to do: adjust: include assumption checks(??) and corrected p-vals (doesn't change anything)
+#between-group comparisons
+ttest_N_PvsC <- datCI %>% filter(resp_construct == 'N') %>% t.test(meanRating ~ participant, .)
+ttest_T_PvsC <- datCI %>% filter(resp_construct == 'T') %>% t.test(meanRating ~ participant, .)
+ttest_U_PvsC <- datCI %>% filter(resp_construct == 'U') %>% t.test(meanRating ~ participant, .)
+
+cohenD_N_PvsC <- datCI %>% filter(resp_construct == 'N') %>% effsize:::cohen.d(meanRating ~ participant, .)
+cohenD_T_PvsC <- datCI %>% filter(resp_construct == 'T') %>% effsize:::cohen.d(meanRating ~ participant, .)
+cohenD_U_PvsC <- datCI %>% filter(resp_construct == 'U') %>% effsize:::cohen.d(meanRating ~ participant, .)
+
+#within-group comparisons
+ttest_C_TvsU <- datCI %>% filter(participant == 'C', resp_construct %in% c("T", "U")) %>% t.test(meanRating ~ resp_construct, .)
+ttest_C_TvsN <- datCI %>% filter(participant == 'C', resp_construct %in% c("T", "N")) %>% t.test(meanRating ~ resp_construct, .)
+ttest_C_UvsN <- datCI %>% filter(participant == 'C', resp_construct %in% c("U", "N")) %>% t.test(meanRating ~ resp_construct, .)
+ttest_P_TvsU <- datCI %>% filter(participant == 'P', resp_construct %in% c("T", "U")) %>% t.test(meanRating ~ resp_construct, .)
+ttest_P_TvsN <- datCI %>% filter(participant == 'P', resp_construct %in% c("T", "N")) %>% t.test(meanRating ~ resp_construct, .)
+ttest_P_UvsN <- datCI %>% filter(participant == 'P', resp_construct %in% c("U", "N")) %>% t.test(meanRating ~ resp_construct, .)
+
+cohenD_C_TvsU <- datCI %>% filter(participant == 'C', resp_construct %in% c("T", "U")) %>% effsize:::cohen.d(meanRating ~ resp_construct, .)
+cohenD_C_TvsN <- datCI %>% filter(participant == 'C', resp_construct %in% c("T", "N")) %>% effsize:::cohen.d(meanRating ~ resp_construct, .)
+cohenD_C_UvsN <- datCI %>% filter(participant == 'C', resp_construct %in% c("U", "N")) %>% effsize:::cohen.d(meanRating ~ resp_construct, .)
+cohenD_P_TvsU <- datCI %>% filter(participant == 'P', resp_construct %in% c("T", "U")) %>% effsize:::cohen.d(meanRating ~ resp_construct, .)
+cohenD_P_TvsN <- datCI %>% filter(participant == 'P', resp_construct %in% c("T", "N")) %>% effsize:::cohen.d(meanRating ~ resp_construct, .)
+cohenD_P_UvsN <- datCI %>% filter(participant == 'P', resp_construct %in% c("U", "N")) %>% effsize:::cohen.d(meanRating ~ resp_construct, .)
+
+n_comparisons <- 9 #for Bonferroni correction
+
+postHocTests <- c("CvsP_trust", "CvsP_neutral", "CvsP_untrust", "control_TvsU","control_TvsN","control_UvsN", "patient_TvsU","patient_TvsN","patient_UvsN")
+pVals_Bonf <- c(ttest_T_PvsC$p.value * n_comparisons, 
+           ttest_N_PvsC$p.value * n_comparisons, 
+           ttest_U_PvsC$p.value * n_comparisons, 
+           ttest_C_TvsU$p.value * n_comparisons, 
+           ttest_C_TvsN$p.value * n_comparisons, 
+           ttest_C_UvsN$p.value * n_comparisons, 
+           ttest_P_TvsU$p.value * n_comparisons, 
+           ttest_P_TvsN$p.value * n_comparisons, 
+           ttest_P_UvsN$p.value * n_comparisons)
+tVals <- c(ttest_T_PvsC$statistic,
+           ttest_N_PvsC$statistic,
+           ttest_U_PvsC$statistic,
+           ttest_C_TvsU$statistic,
+           ttest_C_TvsN$statistic,
+           ttest_C_UvsN$statistic,
+           ttest_P_TvsU$statistic,
+           ttest_P_TvsN$statistic,
+           ttest_P_UvsN$statistic)
+df <- c(ttest_T_PvsC$parameter,
+           ttest_N_PvsC$parameter,
+           ttest_U_PvsC$parameter,
+           ttest_C_TvsU$parameter,
+           ttest_C_TvsN$parameter,
+           ttest_C_UvsN$parameter,
+           ttest_P_TvsU$parameter,
+           ttest_P_TvsN$parameter,
+           ttest_P_UvsN$parameter)
+cohenD <-  c(cohenD_T_PvsC$estimate,
+           cohenD_N_PvsC$estimate,
+           cohenD_U_PvsC$estimate,
+           cohenD_C_TvsU$estimate,
+           cohenD_C_TvsN$estimate,
+           cohenD_C_UvsN$estimate,
+           cohenD_P_TvsU$estimate,
+           cohenD_P_TvsN$estimate,
+           cohenD_P_UvsN$estimate)
+cohenD_conf <-  rbind(cohenD_T_PvsC$conf.int,
+           cohenD_N_PvsC$conf.int,
+           cohenD_U_PvsC$conf.int,
+           cohenD_C_TvsU$conf.int,
+           cohenD_C_TvsN$conf.int,
+           cohenD_C_UvsN$conf.int,
+           cohenD_P_TvsU$conf.int,
+           cohenD_P_TvsN$conf.int,
+           cohenD_P_UvsN$conf.int)
+           
+posthoc_toReport <- tibble(postHocTests, tVals, df, pVals_Bonf, cohenD, conf_d_upper = as.tibble(cohenD_conf)$inf, conf_f_lower = as.tibble(cohenD_conf)$sup)
+posthoc_toReport <- posthoc_toReport %>% mutate(pVals_Bonf = ifelse(pVals_Bonf > 1, 1, pVals_Bonf)) #set Bonferonni corrected p-vals to 1 if p>1.
+
+
+#####
+
+      ## supplemental material: stats with incomplete datasets included
+      dat4JMV_incompl_included <- datCI_all %>% select(scipID, resp_construct, participant, meanRating) %>% 
+        spread(key = resp_construct, value = meanRating) 
+      
+      stat_out_2 <- jmv::anovaRM(
+          data = dat4JMV_incompl_included,
+          rm = list(
+              list(
+                  label="construct",
+                  levels=c("T", "U", "N"))),
+          rmCells = list(
+              list(
+                  measure="T",
+                  cell="T"),
+              list(
+                  measure="U",
+                  cell="U"),
+              list(
+                  measure="N",
+                  cell="N")),
+          bs = "participant",
+          rmTerms = list(
+              "construct"),
+          bsTerms = list(
+              "participant"),
+          effectSize = "partEta",
+          postHoc = list(
+              c("construct", "participant"),
+              "participant",
+              "construct"))
+      
+      stat_out_2
+```
+
+### 
+
+### Compare CI slopeto to PANSS 
+
+```{r compare to PANSS}
+# load PANSS data (have to convert to .csv file, because of .rds format is not read-in correctly (see error: View(PANSS_rds)).
+PANSS_rds <- readRDS("clinical data/PANSS.rds")
+write_csv(PANSS_rds, 'data_tmp_PANSS.csv')
+PANSS <- read_csv('data_tmp_PANSS.csv')
+PANSS <- PANSS %>% rename(scipID = SCIP.ID) %>% filter(!is.na(PANSS_Total))
+
+datPANSS <- datCI_slope %>% inner_join(PANSS) 
+
+datPANS_forplot <- datPANSS %>% 
+  rename(`PANSS general` = P.PANSS_G, `PANSS positive` = PANSS_P, `PANSS Negative` = PANSS_N, `PANSS Total` = PANSS_Total) %>%
+  gather(`PANSS general`, `PANSS positive`,`PANSS Negative`, `PANSS Total`, key = subtest, value = PANSS)
+
+#add meanRating scores for each of the response categories (although we only use 'untrustworthy' here)
+datPANS_forplot <- datCI %>% select(scipID, resp_construct, participant, meanRating) %>% spread(value = meanRating, key = resp_construct) %>% right_join(datPANS_forplot)
+
+
+### investigate correlation between slope ~ PANSS 
+datPANS_forplot %>% filter(subtest == 'PANSS general') %>% 
+  ggplot(aes(x = slope, y  = PANSS)) +
+  geom_point() +
+  geom_smooth(method='lm',formula=y~x) +
+  labs(x = 'Slope of CI ratings')
+
+datPANS_forplot %>% 
+  ggplot(aes(x = slope, y  = PANSS)) +
+  geom_point() +
+  geom_smooth(method='lm',formula=y~x) +
+  labs(x = 'Slope of CI ratings') +
+  facet_wrap(~subtest, scales = "free")
+
+#stat slope ~ PANSS
+shapiro.test(datPANSS$slope)
+shapiro.test(datPANSS$PANSS_Total)
+shapiro.test(datPANSS$P.PANSS_G)
+shapiro.test(datPANSS$PANSS_N)
+shapiro.test(datPANSS$PANSS_P)
+cor.test(~ PANSS_Total + slope, data = datPANSS)
+cor.test(~ P.PANSS_G + slope, data = datPANSS)
+cor.test(~ PANSS_N + slope, data = datPANSS)
+cor.test(~ PANSS_P + slope, data = datPANSS)
+```
+#demographics of raters (Prolific data)
+```{r demographics of raters}
+prolDat_1 <- read_csv("demographics of raters/prolific_export_part1of3.csv")
+prolDat_2 <- read_csv("demographics of raters/prolific_export_part2of3.csv")
+prolDat_3 <- read_csv("demographics of raters/prolific_export_part3of3.csv")
+prolDat <- bind_rows(prolDat_1, prolDat_2, prolDat_3)
+prolDat <- prolDat %>% filter(status == 'APPROVED')
+
+meanAge <- mean(prolDat$age)
+sdAge <- sd(prolDat$age)
+nMale <- sum(prolDat$Sex == "Male")
+```
+
+
